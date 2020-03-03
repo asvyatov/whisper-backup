@@ -2,7 +2,7 @@
 #
 #   Copyright 2014-2017 42 Lines, Inc.
 #   Original Author: Jack Neely <jjneely@42lines.net>
-#
+#   edite by: Alexander Svyatov alexander_svyatov@epam.com
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
 #   You may obtain a copy of the License at
@@ -43,6 +43,7 @@ from pycronscript import CronScript
 import __main__
 
 logger = logging.getLogger(__main__.__name__)
+timeformat = "%Y-%m-%dT%H-%M-%S+00-00"
 
 def listMetrics(storage_dir, storage_path, glob):
     storage_dir = storage_dir.rstrip(os.sep)
@@ -73,41 +74,28 @@ def storageBackend(script):
         sys.exit(1)
     if script.args[1].lower() == "disk":
         import disk
-        return disk.Disk(script.options.bucket, script.options.noop)
+        return disk.Disk(script.options.bucket, script.options.noop), None
+    if script.args[1].lower() == "hdfs":
+        import hdfs
+        import disk
+        hdfsargs = {"endpoint": "localhost:8087"}
+        for i in script.args[2:]:
+            fields = i.split("=")
+            if len(fields) > 1:
+                hdfsargs[fields[0]] = fields[1]
+            else:
+                hdfsargs["endpoint"] = fields[0]
+        return disk.Disk(script.options.bucket, script.options.noop), hdfs.hdfs(script.options.bucket, hdfsargs["endpoint"], script.options.noop)
     if script.args[1].lower() == "noop":
         import noop
-        return noop.NoOP(script.options.bucket, script.options.noop)
-    if script.args[1].lower() == "s3":
-        import s3
-        s3args = {"region": "us-east-1"}
-        for i in script.args[2:]:
-            fields = i.split("=")
-            if len(fields) > 1:
-                s3args[fields[0]] = fields[1]
-            else:
-                s3args["region"] = fields[0]
-        return s3.S3(script.options.bucket, s3args["region"], script.options.noop)
-    if script.args[1].lower() == "swift":
-        import swift
-        return swift.Swift(script.options.bucket, script.options.noop)
-    if script.args[1].lower() == "gcs":
-        import gcs
-        gcsargs = {"project": "", "region": "us"}
-        for i in script.args[2:]:
-            fields = i.split("=")
-            if len(fields) > 1:
-                gcsargs[fields[0]] = fields[1]
-            else:
-                gcsargs["region"] = fields[0]
-        return gcs.GCS(script.options.bucket, gcsargs["project"],
-            gcsargs["region"], script.options.noop)
+        return noop.NoOP(script.options.bucket, script.options.noop), None
 
-    logger.error("Invalid storage backend, must be: disk, gcs, noop, s3, or swift")
+    logger.error("Invalid storage backend, must be: hdfs, disk, gcs, noop, s3, or swift")
     sys.exit(1)
 
 
 def utc():
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    return datetime.datetime.utcnow().strftime(timeformat)
 
 
 def backup(script):
@@ -143,10 +131,21 @@ def backup(script):
 
     workers.close()
     workers.join()
+    upload(script)
     logger.info("Backup complete")
-
     purge(script, { k: True for k, p in jobs })
 
+def upload(script):
+    try:
+        logger.info("Upload started")
+        if not script.options.noop:
+            t = time.time()
+            script.save.put("%s" \
+                    % (script.options.storage_path), utc())
+            logger.debug("Upload of %s took %d seconds"
+                    % (script.options.storage_path, time.time()-t))
+    except Exception as e:
+        logger.warning("Exception during upload: %s" % str(e))
 
 def purge(script, localMetrics):
     """Purge backups in our store that are non-existant on local disk and
@@ -159,54 +158,17 @@ def purge(script, localMetrics):
         return
 
     logger.info("Beginning purge operation.")
-    metrics = search(script)
+    shutil.rmtree("%s/%s" % (script.options.bucket, script.options.storage_path))
+    logger.info("Local purge complete")
+
     expireDate = datetime.datetime.utcnow() - datetime.timedelta(days=script.options.purge)
-    expireStamp = expireDate.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    c = 0
+    expireStamp = expireDate.strftime(timeformat)
 
-    # Search through the in-store metrics
-    for k, v in metrics.items():
-        if k in localMetrics:
-            continue
-        for p in v:
-            ts = p[p.find("/")+1:]
+    for i in script.save.list():
+        if i.endswith(".wsp.%s" % script.options.algorithm):
+            ts = i.replace(".wsp.%s" % script.options.algorithm, "")
             if ts < expireStamp:
-                logger.info("Purging %s @ %s" % (k, ts))
-                try:
-                    # Delete the WSP file first, if the delete of the SHA1
-                    # causes the error, the next run will get it, rather
-                    # than just leaking the WSP storage space.
-                    t = time.time()
-                    if not script.options.noop:
-                        script.store.delete("%s%s/%s.wsp.%s"
-                                % (script.options.storage_path, k, ts,
-                                   script.options.algorithm))
-                        script.store.delete("%s%s/%s.sha1"
-                                % (script.options.storage_path, k, ts))
-                    else:
-                        # Do a list to check for 404s
-                        t = "%s%s/%s" % (k, ts)
-                        d = [ i for i in script.store.list("%s.wsp.%s" \
-                                % (t, script.options.algorithm)) ]
-                        if len(d) == 0:
-                            logger.warn("Purge: Missing file in store: %s.wsp.%s" \
-                                    % (p, script.options.algorithm))
-                        d = [ i for i in script.store.list("%s.sha1" % t) ]
-                        if len(d) == 0:
-                            logger.warn("Purge: Missing file in store: %s.sha1" % t)
-
-                    logger.debug("Purge of %s @ %s took %d seconds" % (k, ts, time.time()-t))
-                except KeyboardInterrupt:
-                    raise
-                except Exception as e:
-                    # On an error here we want to leave files alone.
-                    # This includes file not found (404) errors
-                    logger.warning("Exception during delete: %s" % str(e))
-                else:
-                    c += 1
-
-    logger.info("Purge complete -- %d backups removed" % c)
-
+                script.save.delete("%s/%s" % (script.options.storage_path, ts))
 
 def backupWorker(k, p):
     # Inside this fuction/process 'script' is global
@@ -229,25 +191,6 @@ def backupWorker(k, p):
                 % str(e))
         return
 
-    # SHA1 hash...have we seen this metric DB file before?
-    logger.debug("Calculating hash and searching data store...")
-    blobSHA = hashlib.sha1(blob).hexdigest()
-    knownBackups = []
-    for i in script.store.list(k+"/"):
-        if i.endswith(".sha1"):
-            knownBackups.append(i)
-
-    knownBackups.sort()
-    if len(knownBackups) > 0:
-        i = knownBackups[-1] # The last known backup
-        logger.debug("Examining %s from data store of %d backups"
-                % (i, len(knownBackups)))
-        if script.store.get(i) == blobSHA:
-            logger.info("Metric DB %s is unchanged from last backup, " \
-                        "skipping." % k)
-            # We purposely do not check retention in this case
-            return
-
     # We're going to backup this file, compress it as a normal .gz
     # file so that it can be restored manually if needed
     if not script.options.noop:
@@ -264,53 +207,22 @@ def backupWorker(k, p):
             raise StandardError("Unknown compression format requested")
 
     # Grab our timestamp and assemble final upstream key location
-    logger.debug("Uploading payload as: %s/%s.wsp.%s" \
-            % (k, timestamp, script.options.algorithm))
-    logger.debug("Uploading SHA1 as   : %s/%s.sha1" % (k, timestamp))
+    logger.debug("Saving payload as: %s.wsp.%s" \
+            % (k, script.options.algorithm))
     try:
         if not script.options.noop:
             t = time.time()
-            script.store.put("%s/%s.wsp.%s" \
-                    % (k, timestamp, script.options.algorithm), blobgz.getvalue())
-            script.store.put("%s/%s.sha1" % (k, timestamp), blobSHA)
-            logger.debug("Upload of %s @ %s took %d seconds"
-                    % (k, timestamp, time.time()-t))
+            script.store.put("%s.wsp.%s" \
+                    % (k, script.options.algorithm), blobgz.getvalue())
+            # script.store.put("%s/%s.sha1" % (k, timestamp), blobSHA)
+            logger.debug("Saving of %s took %d seconds"
+                    % (k, time.time()-t))
     except Exception as e:
-        logger.warning("Exception during upload: %s" % str(e))
+        logger.warning("Exception during saving: %s" % str(e))
 
     # Free Memory
     blobgz.close()
     del blob
-
-    # Handle our retention policy, we keep at most X backups
-    while len(knownBackups) + 1 > script.options.retention:
-        # The oldest (and not current) backup
-        i = knownBackups[0].replace(".sha1", "")
-        logger.info("Removing old backup: %s.wsp.%s" % (i, script.options.algorithm))
-        logger.debug("Removing old SHA1: %s.sha1" % i)
-        try:
-            t = time.time()
-            if not script.options.noop:
-                script.store.delete("%s.wsp.%s" % (i, script.options.algorithm))
-                script.store.delete("%s.sha1" % i)
-            else:
-                # Do a list, we want to log if there's a 404
-                d = [ i for i in script.store.list("%s.wsp.%s" \
-                        % (i, script.options.algorithm)) ]
-                if len(d) == 0:
-                    logger.warn("Missing file in store: %s.wsp.%s" \
-                            % (i, script.options.algorithm))
-                d = [ i for i in script.store.list("%s.sha1" % i) ]
-                if len(d) == 0:
-                    logger.warn("Missing file in store: %s.sha1" % i)
-
-            logger.debug("Retention removal of %s took %d seconds"
-                    % (i, time.time()-t))
-        except Exception as e:
-            # On an error here we want to leave files alone
-            logger.warning("Exception during delete: %s" % str(e))
-
-        del knownBackups[0]
 
 
 def findBackup(script, objs, date):
@@ -325,14 +237,14 @@ def findBackup(script, objs, date):
             i = i[:i.find(".")]
         # So now i is just the ISO8601 timestamp
         # XXX: Should probably actually parse the tz here
-        timestamps.append(datetime.datetime.strptime(i, "%Y-%m-%dT%H:%M:%S+00:00"))
+        timestamps.append(datetime.datetime.strptime(i, timeformat))
 
-    refDate = datetime.datetime.strptime(script.options.date, "%Y-%m-%dT%H:%M:%S+00:00")
+    refDate = datetime.datetime.strptime(script.options.date, timeformat)
     timestamps.sort()
     timestamps.reverse()
     for i in timestamps:
         if refDate > i:
-            return i.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            return i.strftime(timeformat)
 
     logger.warning("XXX: I shouldn't have found myself here")
     return None
@@ -386,30 +298,27 @@ def search(script):
 
     for i in script.store.list(prefix=script.options.storage_path):
         i = i[len(script.options.storage_path):]
-        # The SHA1 is my canary/flag, we look for it
-        if i.endswith(".sha1"):
-            # The metric name is everything before the first /
-            m = i[:i.find("/")]
-            if fnmatch(m, script.options.metrics):
-                metrics.setdefault(m, []).append(i[:-5])
+        m = i[:-3]
+        if fnmatch(m, script.options.metrics):
+            metrics.setdefault(m, []).append(i[:-3])
 
     return metrics
 
+def fetchArchiveFromHdfs(script):
+    script.save.get("%s%s" % (script.options.storage_path, script.options.date))
 
 def restore(script):
+    fetchArchiveFromHdfs(script)
     # Build a list of metrics to restore from our object store and globbing
     metrics = search(script)
 
     # For each metric, find the date we want
     for i in metrics.keys():
         objs = metrics[i]
-        d = findBackup(script, objs, script.options.date)
-        logger.info("Restoring %s from timestamp %s" % (i, d))
+        logger.info("Restoring %s from timestamp %s" % (i, script.options.date))
 
-        blobgz  = script.store.get("%s%s/%s.wsp.%s" \
-                % (script.options.storage_path, i, d, script.options.algorithm))
-        blobSHA = script.store.get("%s%s/%s.sha1" \
-                % (script.options.storage_path, i, d))
+        blobgz  = script.store.get("%s/%s.%s" \
+                % (script.options.storage_path, i, script.options.algorithm))
 
         if blobgz is None:
             logger.warning("Skipping missing file in object store: %s/%s.wsp.%s" \
@@ -433,21 +342,11 @@ def restore(script):
                         % (script.options.storage_path, i, d, str(e)))
                 continue
 
-        # Verify
-        if blobSHA is None:
-            logger.warning("Missing SHA1 checksum file...no verification")
-        else:
-            if hashlib.sha1(blob).hexdigest() != blobSHA:
-                logger.warning("Backup does NOT verify, skipping metric %s" \
-                               % i)
-                continue
-
         heal(script, i, blob)
 
         # Clean up
         del blob
         blobgz.close()
-
 
 
 def listbackups(script):
@@ -471,7 +370,7 @@ def listbackups(script):
 
 
 def main():
-    usage = "%prog [options] backup|restore|purge|list disk|gcs|noop|s3|swift [storage args]"
+    usage = "%prog [options] backup|restore|purge|list hdfs|disk|gcs|noop|s3|swift [storage args]"
     options = []
 
     options.append(make_option("-p", "--prefix", type="string",
@@ -523,23 +422,23 @@ def main():
     if mode == "backup":
         with script:
             # Use splay and lockfile settings
-            script.store = storageBackend(script)
+            script.store, script.save = storageBackend(script)
             backup(script)
     elif mode == "restore":
         with script:
             # Use splay and lockfile settings
-            script.store = storageBackend(script)
+            script.store, script.save = storageBackend(script)
             restore(script)
     elif mode == "purge":
         with script:
             # Use splay and lockfile settings
-            script.store = storageBackend(script)
+            script.store, script.save = storageBackend(script)
             localMetrics = listMetrics(script.options.prefix,
                     script.options.storage_path, script.options.metrics)
             purge(script, { k: True for k, p in localMetrics })
     elif mode == "list":
         # Splay and lockfile settings make no sense here
-        script.store = storageBackend(script)
+        script.save, script.store = storageBackend(script)
         listbackups(script)
     else:
         logger.error("Command %s unknown.  Must be one of backup, restore, " \

@@ -58,7 +58,7 @@ issues.  So if you have multiple servers you should set each machine to backup
 to its own bucket/container.
 
 ```
-Usage: whisperbackup.py [options] backup|restore|purge|list disk|gcs|noop|s3|swift [storage args]
+Usage: whisperbackup.py [options] backup|restore|purge|list hdfs|disk|gcs|noop|s3|swift [storage args]
 
 Options:
   -p PREFIX, --prefix=PREFIX
@@ -105,6 +105,11 @@ Options:
   -h, --help            show this help message and exit
 
 ```
+
+as storage-args:
+for s3: region
+for gcs: region
+for hdfs: endpoint for webhdfs, or comma separated list of endpoints
 
 Notes:
 * Purge removes Whisper backups in the datastore for Whisper files not
